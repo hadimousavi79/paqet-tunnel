@@ -168,21 +168,47 @@ check_port_conflict() {
 install_dependencies() {
     print_step "Installing dependencies..."
     
+    echo -e "${YELLOW}Install dependencies? (y/n/s to skip)${NC}"
+    echo -e "${CYAN}Required: libpcap-dev, iptables, curl${NC}"
+    read -t 10 -p "> " install_deps < /dev/tty || install_deps="y"
+    
+    if [[ "$install_deps" =~ ^[Ss]$ ]]; then
+        print_warning "Skipping dependency installation"
+        print_info "Make sure these are installed: libpcap-dev iptables curl"
+        return 0
+    fi
+    
+    if [[ ! "$install_deps" =~ ^[Yy]$ ]] && [ -n "$install_deps" ]; then
+        print_warning "Skipping dependency installation"
+        return 0
+    fi
+    
     local os=$(detect_os)
     case $os in
         ubuntu|debian)
-            apt update -qq 2>/dev/null
-            apt install -y -qq curl wget libpcap-dev iptables lsof > /dev/null 2>&1
+            print_info "Running apt update (may take time)..."
+            timeout 30 apt update -qq 2>/dev/null || {
+                print_warning "apt update timed out or failed"
+                print_info "Continuing anyway..."
+            }
+            
+            print_info "Installing packages..."
+            apt install -y -qq curl wget libpcap-dev iptables lsof > /dev/null 2>&1 || {
+                print_warning "Some packages may have failed to install"
+                print_info "Continuing anyway..."
+            }
             ;;
         centos|rhel|fedora|rocky|almalinux)
-            yum install -y -q curl wget libpcap-devel iptables lsof > /dev/null 2>&1
+            yum install -y -q curl wget libpcap-devel iptables lsof > /dev/null 2>&1 || {
+                print_warning "Some packages may have failed to install"
+            }
             ;;
         *)
             print_warning "Unknown OS. Please install libpcap manually."
             ;;
     esac
     
-    print_success "Dependencies installed"
+    print_success "Dependency installation completed"
 }
 
 download_paqet() {

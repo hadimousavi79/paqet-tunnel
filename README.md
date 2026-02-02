@@ -103,7 +103,25 @@ In X-UI Panel:
 
 This is required because paqet forwards traffic to `127.0.0.1:PORT`, and V2Ray must accept connections on localhost.
 
+## Manual Dependency Installation (Iran Servers)
+
+If `apt update` gets stuck due to internet restrictions in Iran, install dependencies manually **before** running the installer:
+
+```bash
+# Skip apt update and install from cache
+apt install -y --no-install-recommends libpcap-dev iptables curl
+
+# Or install minimal required packages
+apt install -y libpcap0.8 iptables curl
+
+# Verify installation
+dpkg -l | grep -E "libpcap|iptables|curl"
+```
+
+When running the installer, choose **'s'** to skip dependency installation when prompted.
+
 ## Performance Optimization
+
 
 The default settings are conservative. For better speed, edit `/opt/paqet/config.yaml` on **both servers** and add these KCP optimizations:
 
