@@ -1,0 +1,200 @@
+# paqet-tunnel
+
+Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
+
+## Use Case
+
+This tool is designed for users in **Iran** (or other restricted regions) who need to access VPN servers located **abroad**. Instead of connecting directly to your VPN server (which may be blocked or throttled), traffic is routed through a middle server using raw packet tunneling that evades detection.
+
+## Overview
+
+paqet uses raw TCP packet injection to create a tunnel that:
+- Bypasses kernel-level connection tracking (conntrack)
+- Uses KCP protocol for encrypted, reliable transport
+- Is much harder to detect than SSH or VPN protocols
+- Evades Deep Packet Inspection (DPI)
+
+## Architecture
+
+```
+┌─────────────┐                              ┌─────────────┐
+│  Clients    │                              │   Server B  │
+│  (V2Ray)    │                              │  (ABROAD)   │
+└──────┬──────┘                              │  VPN Server │
+       │                                     │  e.g. USA   │
+       │ Connect to                          └──────┬──────┘
+       │ Server A IP                                │
+       ▼                                            │ V2Ray/X-UI
+┌──────────────┐      paqet tunnel           ┌──────▼──────┐
+│   Server A   │◄───────────────────────────►│   paqet     │
+│   (IRAN)     │     (KCP encrypted)         │   server    │
+│ Entry Point  │                             │  port 8888  │
+└──────────────┘                             └─────────────┘
+```
+
+**Servers:**
+- **Server A (Iran)**: Entry point server located in Iran - clients connect here
+- **Server B (Abroad)**: Your VPN server abroad (USA, Germany, etc.) running V2Ray/X-UI
+
+**Traffic Flow:**
+1. Client connects to Server A (Iran) on the V2Ray port
+2. Server A tunnels traffic through paqet to Server B (Abroad)
+3. Server B forwards to local V2Ray (`127.0.0.1:PORT`)
+4. Response flows back through the tunnel
+
+## Quick Start
+
+```bash
+# Run on both servers (as root)
+bash <(curl -fsSL https://raw.githubusercontent.com/g3ntrix/paqet-tunnel/main/install.sh)
+```
+
+## Installation Steps
+
+### Step 1: Setup Server B (Abroad - VPN Server)
+
+```bash
+ssh root@<SERVER_B_IP>
+bash <(curl -fsSL https://raw.githubusercontent.com/g3ntrix/paqet-tunnel/main/install.sh)
+```
+
+1. Select option **1** (Setup Server B)
+2. Confirm network settings (auto-detected)
+3. Choose paqet port (default: `8888`)
+4. Enter V2Ray port(s) (e.g., `443`)
+5. **Save the generated secret key!**
+
+### Step 2: Setup Server A (Iran - Entry Point)
+
+```bash
+ssh root@<SERVER_A_IP>
+bash <(curl -fsSL https://raw.githubusercontent.com/g3ntrix/paqet-tunnel/main/install.sh)
+```
+
+> **Note:** If download is blocked in Iran, the installer will ask for a local file path. Download the paqet binary manually and provide the path.
+
+1. Select option **2** (Setup Server A)
+2. Enter Server B's IP address
+3. Enter paqet port: `8888`
+4. Enter the **secret key** from Step 1
+5. Confirm network settings
+6. Enter port(s) to forward (same as V2Ray ports)
+
+### Step 3: Update Client Config
+
+```
+# Before (direct to Server B abroad)
+vless://uuid@<SERVER_B_IP>:443?type=tcp&...
+
+# After (through Server A in Iran)
+vless://uuid@<SERVER_A_IP>:443?type=tcp&...
+```
+
+Only change the IP address - everything else stays the same!
+
+## ⚠️ Important: V2Ray Inbound Configuration
+
+On **Server B (Abroad)**, your V2Ray/X-UI inbound **MUST** listen on `0.0.0.0` (all interfaces), not just the public IP or empty.
+
+In X-UI Panel:
+1. Go to **Inbounds** → Edit your inbound
+2. Set **Listen IP** to: `0.0.0.0`
+3. Save and restart X-UI
+
+This is required because paqet forwards traffic to `127.0.0.1:PORT`, and V2Ray must accept connections on localhost.
+
+## Performance Optimization
+
+The default settings are conservative. For better speed, edit `/opt/paqet/config.yaml` on **both servers** and add these KCP optimizations:
+
+```yaml
+transport:
+  protocol: "kcp"
+  conn: 4                    # Multiple parallel connections
+  kcp:
+    mode: "fast3"            # Aggressive retransmission
+    key: "YOUR_SECRET_KEY"
+    mtu: 1400
+    snd_wnd: 2048            # Large send window
+    rcv_wnd: 2048            # Large receive window
+    data_shard: 10           # FEC error correction
+    parity_shard: 3          # FEC redundancy
+```
+
+Then restart both services:
+```bash
+systemctl restart paqet
+```
+
+## Commands
+
+```bash
+# Check status
+systemctl status paqet
+
+# View logs
+journalctl -u paqet -f
+
+# Restart service
+systemctl restart paqet
+
+# View configuration
+cat /opt/paqet/config.yaml
+
+# Uninstall
+# Run installer again and select option 5
+```
+
+## Requirements
+
+- Linux server (Ubuntu, Debian, CentOS, etc.)
+- Root access
+- `libpcap-dev` (auto-installed)
+- iptables
+
+## How paqet Works
+
+| Feature | Description |
+|---------|-------------|
+| **Raw Packets** | Injects TCP packets directly, bypassing OS networking |
+| **Kernel Bypass** | Uses pcap library to bypass conntrack |
+| **KCP Protocol** | Encrypted, reliable transport layer |
+| **RST Blocking** | Drops kernel RST packets via iptables |
+| **No Handshake** | No identifiable protocol signature |
+
+## Troubleshooting
+
+**Connection timeout:**
+- Verify secret keys match exactly on both servers
+- Check iptables rules: `iptables -t raw -L -n`
+- Ensure cloud firewall allows the paqet port (8888)
+- Make sure V2Ray inbound listens on `0.0.0.0`
+
+**Download blocked in Iran:**
+- Download paqet manually from [releases](https://github.com/hanselime/paqet/releases)
+- Installer will prompt for local file path
+
+**Port already in use:**
+- Installer will detect this and offer to kill the process
+
+**Service not starting:**
+- Check logs: `journalctl -u paqet -n 50`
+- Verify config: `cat /opt/paqet/config.yaml`
+
+**Slow speed:**
+- Apply performance optimizations above
+- Try increasing `conn` to 8
+- Check server CPU/bandwidth limits
+
+**Clients can't connect:**
+- Verify V2Ray inbound listens on `0.0.0.0`
+- Verify Server A's firewall allows the forwarded ports
+- Check both paqet services are running
+
+## License
+
+MIT License
+
+## Credits
+
+- [paqet](https://github.com/hanselime/paqet) - Raw packet tunneling library by hanselime
