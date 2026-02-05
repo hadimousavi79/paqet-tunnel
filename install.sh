@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.6.0"
+INSTALLER_VERSION="1.7.0"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
@@ -1136,7 +1136,7 @@ edit_config() {
     echo ""
     echo -e "${YELLOW}What would you like to edit?${NC}"
     echo ""
-    echo -e "  ${CYAN}1)${NC} Change ports"
+    echo -e "  ${CYAN}1)${NC} Port Settings (V2Ray/paqet ports)"
     echo -e "  ${CYAN}2)${NC} Change secret key"
     echo -e "  ${CYAN}3)${NC} Change KCP settings"
     echo -e "  ${CYAN}4)${NC} Change network interface"
@@ -1149,7 +1149,7 @@ edit_config() {
     read -p "Choice: " edit_choice < /dev/tty
     
     case $edit_choice in
-        1) edit_ports "$role" ;;
+        1) port_settings_menu ;;
         2) edit_secret_key ;;
         3) edit_kcp_settings ;;
         4) edit_interface ;;
@@ -1215,6 +1215,371 @@ edit_ports() {
         systemctl restart $PAQET_SERVICE
         print_success "Service restarted"
     fi
+}
+
+#===============================================================================
+# V2Ray/Forward Port Settings Menu
+#===============================================================================
+
+port_settings_menu() {
+    local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    
+    while true; do
+        print_banner
+        echo -e "${YELLOW}Port Settings${NC}"
+        echo ""
+        
+        # Show current configuration
+        echo -e "${YELLOW}Current Configuration:${NC}"
+        echo -e "  Role: ${CYAN}$role${NC}"
+        
+        if [ "$role" = "server" ]; then
+            local paqet_port=$(grep -A1 "^listen:" "$PAQET_CONFIG" | grep "addr:" | sed 's/.*:\([0-9]*\)".*/\1/')
+            echo -e "  paqet tunnel port: ${CYAN}$paqet_port${NC}"
+            echo ""
+            echo -e "${YELLOW}Note:${NC} Server B doesn't configure V2Ray ports directly."
+            echo -e "       V2Ray runs separately on its own ports."
+        else
+            local server_addr=$(grep -A1 "^server:" "$PAQET_CONFIG" | grep "addr:" | awk '{print $2}' | tr -d '"')
+            local server_port=$(echo "$server_addr" | cut -d':' -f2)
+            echo -e "  Server B paqet port: ${CYAN}$server_port${NC}"
+            echo ""
+            echo -e "  ${YELLOW}V2Ray Forward Ports:${NC}"
+            get_current_forward_ports | while read port; do
+                echo -e "    - ${CYAN}$port${NC}"
+            done
+        fi
+        
+        echo ""
+        echo -e "${YELLOW}Options:${NC}"
+        echo ""
+        
+        if [ "$role" = "server" ]; then
+            echo -e "  ${CYAN}1)${NC} Change paqet tunnel port"
+        else
+            echo -e "  ${CYAN}1)${NC} Change paqet tunnel port (Server B connection)"
+            echo -e "  ${CYAN}2)${NC} Add V2Ray forward port(s)"
+            echo -e "  ${CYAN}3)${NC} Remove V2Ray forward port"
+            echo -e "  ${CYAN}4)${NC} Replace all V2Ray forward ports"
+        fi
+        echo -e "  ${CYAN}0)${NC} Back to main menu"
+        echo ""
+        
+        read -p "Choice: " port_choice < /dev/tty
+        
+        case $port_choice in
+            1) 
+                if [ "$role" = "server" ]; then
+                    change_paqet_port_server
+                else
+                    change_paqet_port_client
+                fi
+                ;;
+            2) 
+                if [ "$role" = "client" ]; then
+                    add_forward_ports
+                else
+                    print_error "Invalid choice"
+                fi
+                ;;
+            3) 
+                if [ "$role" = "client" ]; then
+                    remove_forward_port
+                else
+                    print_error "Invalid choice"
+                fi
+                ;;
+            4) 
+                if [ "$role" = "client" ]; then
+                    replace_all_forward_ports
+                else
+                    print_error "Invalid choice"
+                fi
+                ;;
+            0) return 0 ;;
+            *) print_error "Invalid choice" ;;
+        esac
+        
+        echo ""
+        echo -e "${YELLOW}Press Enter to continue...${NC}"
+        read < /dev/tty
+    done
+}
+
+# Get current forward ports from config
+get_current_forward_ports() {
+    # Extract port from listen: "0.0.0.0:PORT" format
+    grep 'listen:' "$PAQET_CONFIG" 2>/dev/null | grep -oE ':[0-9]+"' | tr -d ':"' | sort -nu
+}
+
+# Change paqet port on Server B
+change_paqet_port_server() {
+    echo ""
+    local current_port=$(grep -A1 "^listen:" "$PAQET_CONFIG" | grep "addr:" | sed 's/.*:\([0-9]*\)".*/\1/')
+    local current_ip_port=$(grep -A2 "^network:" "$PAQET_CONFIG" | grep -A1 "ipv4:" | grep "addr:" | awk '{print $2}' | tr -d '"')
+    local current_ip=$(echo "$current_ip_port" | cut -d':' -f1)
+    
+    echo -e "Current paqet port: ${CYAN}$current_port${NC}"
+    echo ""
+    
+    read_port "Enter new paqet listen port" NEW_PORT "$current_port"
+    
+    if [ "$NEW_PORT" = "$current_port" ]; then
+        print_info "Port unchanged"
+        return 0
+    fi
+    
+    # Check port conflict
+    check_port_conflict "$NEW_PORT"
+    
+    # Update listen section
+    sed -i "s/addr: \":[0-9]*\"/addr: \":${NEW_PORT}\"/" "$PAQET_CONFIG"
+    
+    # Update network.ipv4.addr section
+    sed -i "s|addr: \"${current_ip}:[0-9]*\"|addr: \"${current_ip}:${NEW_PORT}\"|" "$PAQET_CONFIG"
+    
+    # Update iptables
+    setup_iptables "$NEW_PORT"
+    
+    print_success "paqet port updated to $NEW_PORT"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+    
+    echo ""
+    print_warning "Remember to update Server A with the new port!"
+}
+
+# Change paqet port on Server A (connection to Server B)
+change_paqet_port_client() {
+    echo ""
+    local server_addr=$(grep -A1 "^server:" "$PAQET_CONFIG" | grep "addr:" | awk '{print $2}' | tr -d '"')
+    local server_ip=$(echo "$server_addr" | cut -d':' -f1)
+    local server_port=$(echo "$server_addr" | cut -d':' -f2)
+    
+    echo -e "Current Server B address: ${CYAN}$server_addr${NC}"
+    echo ""
+    
+    read_port "Enter Server B paqet port" NEW_PORT "$server_port"
+    
+    if [ "$NEW_PORT" = "$server_port" ]; then
+        print_info "Port unchanged"
+        return 0
+    fi
+    
+    # Update server address
+    sed -i "s|addr: \"${server_ip}:${server_port}\"|addr: \"${server_ip}:${NEW_PORT}\"|" "$PAQET_CONFIG"
+    
+    print_success "Server B port updated to $NEW_PORT"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+# Add new forward port(s)
+add_forward_ports() {
+    echo ""
+    echo -e "${CYAN}Current V2Ray forward ports:${NC}"
+    local current_ports=$(get_current_forward_ports | tr '\n' ',' | sed 's/,$//')
+    echo -e "  ${YELLOW}$current_ports${NC}"
+    echo ""
+    
+    read_ports "Enter port(s) to ADD (comma-separated)" NEW_PORTS
+    
+    # Get existing ports
+    local existing_ports=$(get_current_forward_ports | tr '\n' ' ')
+    
+    # Parse new ports and check for duplicates
+    local ports_to_add=""
+    local duplicates=""
+    IFS=',' read -ra NEW_PORT_ARRAY <<< "$NEW_PORTS"
+    for port in "${NEW_PORT_ARRAY[@]}"; do
+        port=$(echo "$port" | tr -d ' ')
+        if echo "$existing_ports" | grep -qw "$port"; then
+            duplicates="${duplicates}${port} "
+        else
+            # Check port conflict
+            if ss -tuln | grep -q ":${port} "; then
+                print_warning "Port $port is already in use by another process"
+                echo -e "${YELLOW}Add anyway? (y/n)${NC}"
+                read -p "> " add_anyway < /dev/tty
+                if [[ ! "$add_anyway" =~ ^[Yy]$ ]]; then
+                    continue
+                fi
+            fi
+            ports_to_add="${ports_to_add}${port} "
+        fi
+    done
+    
+    if [ -n "$duplicates" ]; then
+        print_warning "Skipping duplicate ports: $duplicates"
+    fi
+    
+    if [ -z "$ports_to_add" ]; then
+        print_info "No new ports to add"
+        return 0
+    fi
+    
+    # Combine existing and new ports
+    local all_ports="$existing_ports $ports_to_add"
+    
+    # Rebuild forward section
+    rebuild_forward_config "$all_ports"
+    
+    print_success "Added ports: $ports_to_add"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+# Remove a forward port
+remove_forward_port() {
+    echo ""
+    echo -e "${CYAN}Current V2Ray forward ports:${NC}"
+    local current_ports_list=$(get_current_forward_ports)
+    local port_count=0
+    local ports_array=()
+    
+    while read port; do
+        if [ -n "$port" ]; then
+            port_count=$((port_count + 1))
+            ports_array+=("$port")
+            echo -e "  ${CYAN}$port_count)${NC} $port"
+        fi
+    done <<< "$current_ports_list"
+    
+    if [ $port_count -eq 0 ]; then
+        print_error "No forward ports configured"
+        return 1
+    fi
+    
+    if [ $port_count -eq 1 ]; then
+        print_error "Cannot remove the last port. At least one forward port is required."
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}Enter the port number to remove (or port value):${NC}"
+    read -p "> " remove_input < /dev/tty
+    
+    local port_to_remove=""
+    
+    # Check if input is a menu number or port value
+    if [[ "$remove_input" =~ ^[0-9]+$ ]] && [ "$remove_input" -le "$port_count" ] && [ "$remove_input" -gt 0 ]; then
+        port_to_remove="${ports_array[$((remove_input - 1))]}"
+    else
+        # Treat as port value
+        port_to_remove="$remove_input"
+    fi
+    
+    # Verify port exists
+    if ! echo "$current_ports_list" | grep -qw "$port_to_remove"; then
+        print_error "Port $port_to_remove is not in the current configuration"
+        return 1
+    fi
+    
+    # Build new port list without the removed port
+    local new_ports=""
+    for port in "${ports_array[@]}"; do
+        if [ "$port" != "$port_to_remove" ]; then
+            new_ports="${new_ports}${port} "
+        fi
+    done
+    
+    # Rebuild forward section
+    rebuild_forward_config "$new_ports"
+    
+    print_success "Removed port: $port_to_remove"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+# Replace all forward ports
+replace_all_forward_ports() {
+    echo ""
+    echo -e "${CYAN}Current V2Ray forward ports:${NC}"
+    local current_ports=$(get_current_forward_ports | tr '\n' ',' | sed 's/,$//')
+    echo -e "  ${YELLOW}$current_ports${NC}"
+    echo ""
+    
+    print_warning "This will replace ALL current forward ports!"
+    echo ""
+    
+    read_ports "Enter new forward ports (comma-separated)" NEW_PORTS "$current_ports"
+    
+    # Check port conflicts
+    IFS=',' read -ra PORTS <<< "$NEW_PORTS"
+    local ports_str=""
+    for port in "${PORTS[@]}"; do
+        port=$(echo "$port" | tr -d ' ')
+        if ss -tuln | grep -q ":${port} " && ! echo "$current_ports" | grep -q "$port"; then
+            print_warning "Port $port is already in use by another process"
+            echo -e "${YELLOW}Include anyway? (y/n)${NC}"
+            read -p "> " include_anyway < /dev/tty
+            if [[ ! "$include_anyway" =~ ^[Yy]$ ]]; then
+                continue
+            fi
+        fi
+        ports_str="${ports_str}${port} "
+    done
+    
+    if [ -z "$ports_str" ]; then
+        print_error "No valid ports provided"
+        return 1
+    fi
+    
+    # Rebuild forward section
+    rebuild_forward_config "$ports_str"
+    
+    print_success "Forward ports updated to: $ports_str"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+# Helper: Rebuild the forward config section
+rebuild_forward_config() {
+    local ports_str="$1"
+    
+    local forward_config=""
+    for port in $ports_str; do
+        port=$(echo "$port" | tr -d ' ')
+        if [ -n "$port" ]; then
+            forward_config="${forward_config}
+  - listen: \"0.0.0.0:${port}\"
+    target: \"127.0.0.1:${port}\"
+    protocol: \"tcp\""
+        fi
+    done
+    
+    # Use awk to replace the forward section
+    awk -v new_forward="forward:${forward_config}" '
+        /^forward:/ { in_forward=1; print new_forward; next }
+        in_forward && /^[a-z]/ { in_forward=0 }
+        !in_forward { print }
+    ' "$PAQET_CONFIG" > "${PAQET_CONFIG}.tmp"
+    mv "${PAQET_CONFIG}.tmp" "$PAQET_CONFIG"
 }
 
 edit_secret_key() {

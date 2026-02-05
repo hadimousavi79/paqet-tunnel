@@ -2,12 +2,47 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.6.0
+**Current Version:** v1.7.0
+
+## Changelog
+
+### v1.7.0
+- **Port Settings** - Under Edit Configuration (option 5): add, remove, or replace V2Ray/paqet ports without full reconfiguration
+- View current port configuration and change paqet tunnel port on both server roles
+
+### v1.6.0
+- **Install as Command** - Option to install script as `paqet-tunnel` system command
+- Run `paqet-tunnel` anytime without needing curl
+- Update/remove command from menu
+
+### v1.5.1
+- **MTU Configuration** - Added MTU setting in KCP configuration
+- Helps fix EOF errors on restrictive networks (try 1280-1300)
+
+### v1.5.0
+- **Iran Network Optimization** - DNS finder and apt mirror selector for Iran servers
+- Improved version fetching with fallback to raw main branch
+
+### v1.4.0
+- **Enhanced Input Validation** - Won't exit on invalid input, keeps asking until valid
+- New default configurations for better out-of-box experience
+- Improved TCP connectivity test messaging for raw socket behavior
+
+### v1.3.0
+- Auto-check `/root/paqet` for local archives before downloading
+- Skip option for dependency installation
+- Manual install guide for restricted networks
+
+### v1.0.0
+- Initial release with Server A/B setup
+- Configuration editor for ports, keys, KCP settings
+- Connection test tool and auto-updater
 
 ## Features
 
 - **Interactive Setup** - Guided installation for both Iran and abroad servers
 - **Install as Command** - Run `paqet-tunnel` after installing
+- **Port Settings Menu** - Add, remove, or change V2Ray ports without reconfiguring
 - **Input Validation** - Won't exit on invalid input, keeps asking until valid
 - **Iran Network Optimization** - Optional DNS and apt mirror optimization for Iran servers
 - **Configuration Editor** - Change ports, keys, KCP settings, and MTU without manual file editing
@@ -243,11 +278,24 @@ r) Remove paqet-tunnel command
 
 Change settings without manually editing config files:
 
-- **Ports** - Change paqet or forwarded ports
+- **Port Settings** - Add, remove, or change V2Ray/paqet ports (see below)
 - **Secret Key** - Generate or set a new key
-- **KCP Settings** - Adjust mode (normal/fast/fast2/fast3) and connections
+- **KCP Settings** - Adjust mode (normal/fast/fast2/fast3), connections, and MTU
 - **Network Interface** - Change the network interface
 - **Server B Address** - Update the abroad server IP/port (client only)
+
+**Port Settings** (first option in Edit Configuration):
+
+**For Server A (Iran/Client):**
+- View current V2Ray forward ports
+- Change paqet tunnel port (connection to Server B)
+- Add new V2Ray forward port(s)
+- Remove individual V2Ray forward port
+- Replace all V2Ray forward ports
+
+**For Server B (Abroad/Server):**
+- View current paqet tunnel port
+- Change paqet tunnel port
 
 ### Test Connection (Option 6)
 
