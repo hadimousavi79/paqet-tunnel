@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.5.0"
+INSTALLER_VERSION="1.5.1"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
@@ -27,6 +27,7 @@ DEFAULT_PAQET_PORT="8888"           # Port for paqet tunnel communication
 DEFAULT_FORWARD_PORTS="9090"        # Default ports to forward (comma-separated)
 DEFAULT_KCP_MODE="fast"             # KCP mode: normal, fast, fast2, fast3
 DEFAULT_KCP_CONN="1"                # Number of parallel connections
+DEFAULT_KCP_MTU="1350"              # MTU size (1280-1500, lower for restrictive networks)
 
 # Colors
 RED='\033[0;31m'
@@ -801,10 +802,11 @@ network:
 
 transport:
   protocol: "kcp"
-  conn: 1
+  conn: ${DEFAULT_KCP_CONN}
   kcp:
-    mode: "fast"
+    mode: "${DEFAULT_KCP_MODE}"
     key: "${secret_key}"
+    mtu: ${DEFAULT_KCP_MTU}
 EOF
     
     print_success "Configuration created"
@@ -946,10 +948,11 @@ server:
 
 transport:
   protocol: "kcp"
-  conn: 1
+  conn: ${DEFAULT_KCP_CONN}
   kcp:
-    mode: "fast"
+    mode: "${DEFAULT_KCP_MODE}"
     key: "${SECRET_KEY}"
+    mtu: ${DEFAULT_KCP_MTU}
 EOF
     
     print_success "Configuration created"
@@ -1239,10 +1242,35 @@ edit_kcp_settings() {
     local current_conn=$(grep "conn:" "$PAQET_CONFIG" | awk '{print $2}')
     read_required "Enter number of parallel connections (1-8)" KCP_CONN "$current_conn"
     
+    echo ""
+    echo -e "${YELLOW}MTU (Maximum Transmission Unit):${NC}"
+    echo -e "  ${CYAN}1400-1500${NC} - Normal networks"
+    echo -e "  ${CYAN}1350${NC}      - Recommended for most cases"
+    echo -e "  ${CYAN}1280-1300${NC} - Restrictive networks / connection issues"
+    echo ""
+    
+    local current_mtu=$(grep "mtu:" "$PAQET_CONFIG" | awk '{print $2}')
+    [ -z "$current_mtu" ] && current_mtu="$DEFAULT_KCP_MTU"
+    read_required "Enter MTU (1280-1500)" KCP_MTU "$current_mtu"
+    
+    # Validate MTU range
+    if [ "$KCP_MTU" -lt 1280 ] || [ "$KCP_MTU" -gt 1500 ]; then
+        print_warning "MTU should be between 1280 and 1500. Using $current_mtu"
+        KCP_MTU="$current_mtu"
+    fi
+    
     sed -i "s/mode: \"[^\"]*\"/mode: \"${KCP_MODE}\"/" "$PAQET_CONFIG"
     sed -i "s/conn: [0-9]*/conn: ${KCP_CONN}/" "$PAQET_CONFIG"
     
-    print_success "KCP settings updated"
+    # Update or add MTU setting
+    if grep -q "mtu:" "$PAQET_CONFIG"; then
+        sed -i "s/mtu: [0-9]*/mtu: ${KCP_MTU}/" "$PAQET_CONFIG"
+    else
+        # Add mtu after key line
+        sed -i "/key:/a\\    mtu: ${KCP_MTU}" "$PAQET_CONFIG"
+    fi
+    
+    print_success "KCP settings updated (mode: $KCP_MODE, conn: $KCP_CONN, mtu: $KCP_MTU)"
     
     echo ""
     read_confirm "Restart paqet service to apply changes?" restart_now "y"
@@ -1644,6 +1672,7 @@ show_port_config() {
     echo -e "  ${YELLOW}Default forward ports:${NC}  ${CYAN}$DEFAULT_FORWARD_PORTS${NC}"
     echo -e "  ${YELLOW}KCP mode:${NC}               ${CYAN}$DEFAULT_KCP_MODE${NC}"
     echo -e "  ${YELLOW}KCP connections:${NC}        ${CYAN}$DEFAULT_KCP_CONN${NC}"
+    echo -e "  ${YELLOW}KCP MTU:${NC}                ${CYAN}$DEFAULT_KCP_MTU${NC}"
     echo -e "${MAGENTA}════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "${CYAN}To change defaults, edit the script header configuration section.${NC}"
