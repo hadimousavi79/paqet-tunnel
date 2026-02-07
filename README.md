@@ -2,9 +2,17 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.7.0
+**Current Version:** v1.8.0
 
 ## Changelog
+
+### v1.8.0
+- **Multi-Tunnel Support** - Run multiple named tunnels on Server A, each connecting to a different Server B
+- Each tunnel gets its own config file (`config-<name>.yaml`) and systemd service (`paqet-<name>`)
+- New **Manage Tunnels** menu (option 6): add, remove, restart, stop, start individual tunnels
+- Status check now shows all tunnels at once
+- Edit/View/Test operations prompt for tunnel selection when multiple exist
+- Server B setup remains unchanged (single instance)
 
 ### v1.7.0
 - **Port Settings** - Under Edit Configuration (option 5): add, remove, or replace V2Ray/paqet ports without full reconfiguration
@@ -41,6 +49,7 @@ Easy installer for tunneling VPN traffic through a middle server using [paqet](h
 ## Features
 
 - **Interactive Setup** - Guided installation for both Iran and abroad servers
+- **Multi-Tunnel Support** - Connect one Server A to multiple Server Bs with named tunnels
 - **Install as Command** - Run `paqet-tunnel` after installing
 - **Port Settings Menu** - Add, remove, or change V2Ray ports without reconfiguring
 - **Input Validation** - Won't exit on invalid input, keeps asking until valid
@@ -65,6 +74,8 @@ paqet uses raw TCP packet injection to create a tunnel that:
 
 ## Architecture
 
+### Single Server B
+
 ```
 ┌─────────────┐                              ┌─────────────┐
 │  Clients    │                              │   Server B  │
@@ -80,6 +91,30 @@ paqet uses raw TCP packet injection to create a tunnel that:
 │ Entry Point  │                             │  port 8888  │
 └──────────────┘                             └─────────────┘
 ```
+
+### Multiple Server Bs
+
+Server A can run multiple named tunnels, each connecting to a different Server B:
+
+```
+                                             ┌──────────────┐
+                          paqet-usa          │  Server B1   │
+                     ┌──────────────────────►│  (USA)       │
+                     │   ports 443,8443      │  port 8888   │
+┌─────────────┐      │                       └──────────────┘
+│  Clients    │      │                       ┌──────────────┐
+│  (V2Ray)    │──►┌──┴───────────┐  germany  │  Server B2   │
+└─────────────┘   │   Server A   ├──────────►│  (Germany)   │
+                  │   (IRAN)     │  port 2053 │  port 8888   │
+                  └──┬───────────┘           └──────────────┘
+                     │                       ┌──────────────┐
+                     │  paqet-france         │  Server B3   │
+                     └──────────────────────►│  (France)    │
+                         port 2096           │  port 8888   │
+                                             └──────────────┘
+```
+
+Each tunnel has its own config (`/opt/paqet/config-<name>.yaml`) and service (`paqet-<name>`).
 
 **Servers:**
 
@@ -137,11 +172,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/g3ntrix/paqet-tunnel/main/in
 
 1. Select option **2** (Setup Server A)
 2. **Optional:** Run Iran network optimization (DNS + apt mirrors)
-3. Enter Server B's IP address
-4. Enter paqet port: `8888`
-5. Enter the **secret key** from Step 1
-6. Confirm network settings
-7. Enter port(s) to forward (same as V2Ray ports)
+3. Enter a **tunnel name** (e.g., `usa`, `germany`)
+4. Enter Server B's IP address
+5. Enter paqet port: `8888`
+6. Enter the **secret key** from Step 1
+7. Confirm network settings
+8. Enter port(s) to forward (same as V2Ray ports)
+
+To add more tunnels, run setup again (option **2** or via **Manage Tunnels**) with a different name.
 
 #### Iran Network Optimization (Optional)
 
@@ -226,7 +264,7 @@ You can adjust:
 
 ### Manual Tuning Example
 
-Edit `/opt/paqet/config.yaml` on **both servers**:
+Edit the config file on **both servers** (Server B: `config.yaml`, Server A: `config-<name>.yaml`):
 
 ```yaml
 transport:
@@ -242,10 +280,14 @@ transport:
     parity_shard: 3          # FEC redundancy
 ```
 
-Then restart both services:
+Then restart:
 
 ```bash
+# Server B
 systemctl restart paqet
+
+# Server A (replace <name> with tunnel name)
+systemctl restart paqet-<name>
 ```
 
 ## Menu Options
@@ -261,12 +303,13 @@ The installer provides a full management interface:
 3) Check Status
 4) View Configuration
 5) Edit Configuration
-6) Test Connection
+6) Manage Tunnels (add/remove/restart)
+7) Test Connection
 
 ── Maintenance ──
-7) Check for Updates
-8) Show Port Defaults
-9) Uninstall paqet
+8) Check for Updates
+9) Show Port Defaults
+u) Uninstall paqet
 
 ── Script ──
 i) Install as 'paqet-tunnel' command
@@ -274,9 +317,17 @@ r) Remove paqet-tunnel command
 0) Exit
 ```
 
+### Manage Tunnels (Option 6)
+
+Add, remove, and control individual tunnels on Server A:
+
+- **Add new tunnel** - Runs Server A setup with a new tunnel name
+- **Remove a tunnel** - Stops service and removes config for a selected tunnel
+- **Restart/Stop/Start** - Control individual tunnel services
+
 ### Edit Configuration (Option 5)
 
-Change settings without manually editing config files:
+Change settings without manually editing config files. If multiple tunnels exist, you'll be asked which one to edit:
 
 - **Port Settings** - Add, remove, or change V2Ray/paqet ports (see below)
 - **Secret Key** - Generate or set a new key
@@ -297,7 +348,7 @@ Change settings without manually editing config files:
 - View current paqet tunnel port
 - Change paqet tunnel port
 
-### Test Connection (Option 6)
+### Test Connection (Option 7)
 
 Built-in diagnostics that automatically detect your server role and run appropriate tests:
 
@@ -319,7 +370,7 @@ Built-in diagnostics that automatically detect your server role and run appropri
 
 > **Note:** TCP probe tests may show "no response" even when the tunnel works. This is normal - paqet uses raw sockets and doesn't respond to standard TCP probes.
 
-### Check for Updates (Option 7)
+### Check for Updates (Option 8)
 
 The installer can update itself:
 
@@ -331,20 +382,24 @@ The installer can update itself:
 ## Commands
 
 ```bash
-# Check status
-systemctl status paqet
+# Check status of a tunnel (replace <name> with tunnel name, e.g., usa)
+systemctl status paqet-<name>
 
 # View logs
-journalctl -u paqet -f
+journalctl -u paqet-<name> -f
 
-# Restart service
-systemctl restart paqet
+# Restart a tunnel
+systemctl restart paqet-<name>
 
 # View configuration
+cat /opt/paqet/config-<name>.yaml
+
+# For Server B (single instance, no name needed)
+systemctl status paqet
 cat /opt/paqet/config.yaml
 
 # Uninstall
-# Run installer again and select option 9
+# Run installer again and select option 'u'
 ```
 
 ## Requirements
@@ -374,7 +429,7 @@ cat /opt/paqet/config.yaml
 - Check iptables rules: `iptables -t raw -L -n`
 - Ensure cloud firewall allows the paqet port (8888)
 - Make sure V2Ray inbound listens on `0.0.0.0`
-- Run the **Test Connection** tool (option 6) for diagnostics
+- Run the **Test Connection** tool (option 7) for diagnostics
 
 **Download blocked in Iran:**
 
@@ -388,8 +443,8 @@ cat /opt/paqet/config.yaml
 
 **Service not starting:**
 
-- Check logs: `journalctl -u paqet -n 50`
-- Verify config: `cat /opt/paqet/config.yaml`
+- Check logs: `journalctl -u paqet-<name> -n 50`
+- Verify config: `cat /opt/paqet/config-<name>.yaml`
 
 **Slow speed:**
 
@@ -402,7 +457,7 @@ cat /opt/paqet/config.yaml
 - Verify V2Ray inbound listens on `0.0.0.0`
 - Verify Server A's firewall allows the forwarded ports
 - Check both paqet services are running
-- Use **Test Connection** (option 6) to diagnose
+- Use **Test Connection** (option 7) to diagnose
 
 **TCP probe shows "no response":**
 

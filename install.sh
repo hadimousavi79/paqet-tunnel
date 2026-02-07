@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.7.0"
+INSTALLER_VERSION="1.8.0"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
@@ -311,6 +311,198 @@ read_optional() {
     fi
     
     eval "$varname='$value'"
+}
+
+#===============================================================================
+# Multi-Tunnel Helper Functions
+#===============================================================================
+
+# Read and validate tunnel name
+# Usage: read_tunnel_name "prompt" "variable_name" ["default_value"]
+read_tunnel_name() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    local name_regex='^[a-z0-9][a-z0-9-]*$'
+    
+    while true; do
+        if [ -n "$default" ]; then
+            echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        echo -e "${CYAN}(lowercase, alphanumeric and hyphens only, e.g., usa, germany, server-1)${NC}"
+        read -p "> " value < /dev/tty
+        
+        # Use default if provided and input is empty
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        # Validate
+        if [ -z "$value" ]; then
+            print_error "Tunnel name is required."
+            echo ""
+        elif ! [[ "$value" =~ $name_regex ]]; then
+            print_error "Invalid name. Use lowercase letters, numbers, and hyphens only."
+            echo ""
+        elif [ ${#value} -gt 32 ]; then
+            print_error "Name too long. Maximum 32 characters."
+            echo ""
+        elif [ -f "$PAQET_DIR/config-${value}.yaml" ]; then
+            print_error "Tunnel '$value' already exists. Choose a different name."
+            echo ""
+        else
+            eval "$varname='$value'"
+            return 0
+        fi
+    done
+}
+
+# Get list of all tunnel config files (legacy + named)
+get_tunnel_configs() {
+    # Legacy config first
+    if [ -f "$PAQET_DIR/config.yaml" ]; then
+        local role=$(grep "^role:" "$PAQET_DIR/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"')
+        # Only include legacy if it's a client config (Server A)
+        # Server B configs are single-instance and don't need tunnel management
+        if [ "$role" = "client" ]; then
+            echo "$PAQET_DIR/config.yaml"
+        fi
+    fi
+    # Named tunnel configs
+    for f in "$PAQET_DIR"/config-*.yaml; do
+        [ -f "$f" ] && echo "$f"
+    done
+}
+
+# Get ALL config files including server configs (for status/uninstall)
+get_all_configs() {
+    if [ -f "$PAQET_DIR/config.yaml" ]; then
+        echo "$PAQET_DIR/config.yaml"
+    fi
+    for f in "$PAQET_DIR"/config-*.yaml; do
+        [ -f "$f" ] && echo "$f"
+    done
+}
+
+# Extract tunnel name from config path
+# Returns "default" for legacy config.yaml, or the name for config-<name>.yaml
+get_tunnel_name() {
+    local config_path="$1"
+    local filename=$(basename "$config_path")
+    if [ "$filename" = "config.yaml" ]; then
+        echo "default"
+    else
+        echo "$filename" | sed 's/^config-//; s/\.yaml$//'
+    fi
+}
+
+# Get service name for a tunnel
+get_tunnel_service() {
+    local config_path="$1"
+    local name=$(get_tunnel_name "$config_path")
+    if [ "$name" = "default" ]; then
+        echo "paqet"
+    else
+        echo "paqet-${name}"
+    fi
+}
+
+# Count total number of tunnel configs (client tunnels only)
+get_tunnel_count() {
+    local count=0
+    local configs=$(get_tunnel_configs)
+    if [ -n "$configs" ]; then
+        count=$(echo "$configs" | wc -l)
+    fi
+    echo "$count"
+}
+
+# List all tunnels with status
+list_tunnels() {
+    local configs=$(get_all_configs)
+    
+    if [ -z "$configs" ]; then
+        print_info "No tunnels configured"
+        return 1
+    fi
+    
+    local idx=0
+    while IFS= read -r config_file; do
+        idx=$((idx + 1))
+        local name=$(get_tunnel_name "$config_file")
+        local service=$(get_tunnel_service "$config_file")
+        local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
+        
+        # Get status
+        local status="${RED}Stopped${NC}"
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            status="${GREEN}Running${NC}"
+        fi
+        
+        # Get details based on role
+        local details=""
+        if [ "$role" = "client" ]; then
+            local server_addr=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+            local forward_ports=$(grep 'listen:' "$config_file" 2>/dev/null | grep -oE ':[0-9]+"' | tr -d ':"' | tr '\n' ',' | sed 's/,$//')
+            details="-> ${server_addr}  ports: ${forward_ports}"
+        elif [ "$role" = "server" ]; then
+            local listen_addr=$(grep -A1 "^listen:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+            details="listening on ${listen_addr}"
+        fi
+        
+        echo -e "  ${CYAN}${idx})${NC} ${YELLOW}${name}${NC} [${status}] (${role}) ${details}"
+    done <<< "$configs"
+}
+
+# Select a tunnel interactively, sets PAQET_CONFIG and PAQET_SERVICE globals
+# Returns 0 on success, 1 if no tunnels or user cancelled
+select_tunnel() {
+    local prompt="${1:-Select tunnel}"
+    local configs=$(get_all_configs)
+    local count=0
+    if [ -n "$configs" ]; then
+        count=$(echo "$configs" | wc -l)
+    fi
+    
+    if [ -z "$configs" ] || [ "$count" -eq 0 ]; then
+        print_error "No tunnels configured"
+        return 1
+    fi
+    
+    # If only one tunnel, auto-select it
+    if [ "$count" -eq 1 ]; then
+        local config_file=$(echo "$configs" | head -1)
+        PAQET_CONFIG="$config_file"
+        PAQET_SERVICE=$(get_tunnel_service "$config_file")
+        local name=$(get_tunnel_name "$config_file")
+        print_info "Using tunnel: $name"
+        return 0
+    fi
+    
+    # Multiple tunnels - show list and ask
+    echo ""
+    echo -e "${YELLOW}${prompt}:${NC}"
+    echo ""
+    list_tunnels
+    echo ""
+    
+    read -p "Choice: " tunnel_choice < /dev/tty
+    
+    # Validate choice
+    if ! [[ "$tunnel_choice" =~ ^[0-9]+$ ]] || [ "$tunnel_choice" -lt 1 ] || [ "$tunnel_choice" -gt "$count" ]; then
+        print_error "Invalid choice"
+        return 1
+    fi
+    
+    local config_file=$(echo "$configs" | sed -n "${tunnel_choice}p")
+    PAQET_CONFIG="$config_file"
+    PAQET_SERVICE=$(get_tunnel_service "$config_file")
+    local name=$(get_tunnel_name "$config_file")
+    print_info "Selected tunnel: $name"
+    return 0
 }
 
 #===============================================================================
@@ -852,6 +1044,22 @@ setup_server_a() {
     echo -e "${CYAN}This server accepts client connections and tunnels to Server B${NC}"
     echo ""
     
+    # Ask for tunnel name
+    echo -e "${CYAN}Each tunnel needs a unique name to identify the Server B it connects to.${NC}"
+    echo -e "${CYAN}Examples: usa, germany, server-1${NC}"
+    echo ""
+    read_tunnel_name "Enter tunnel name" TUNNEL_NAME
+    
+    # Set per-tunnel config and service paths
+    PAQET_CONFIG="$PAQET_DIR/config-${TUNNEL_NAME}.yaml"
+    PAQET_SERVICE="paqet-${TUNNEL_NAME}"
+    
+    echo ""
+    print_info "Tunnel '${TUNNEL_NAME}' will use:"
+    echo -e "  Config:  ${CYAN}$PAQET_CONFIG${NC}"
+    echo -e "  Service: ${CYAN}$PAQET_SERVICE${NC}"
+    echo ""
+    
     # Detect network configuration
     local interface=$(get_default_interface)
     local local_ip=$(get_local_ip "$interface")
@@ -866,7 +1074,7 @@ setup_server_a() {
     echo ""
     
     # Get Server B details (with validation - keeps asking until valid)
-    echo -e "${CYAN}Enter Server B (Abroad) connection details${NC}"
+    echo -e "${CYAN}Enter Server B (Abroad) connection details for tunnel '${TUNNEL_NAME}'${NC}"
     read_ip "Server B public IP address" SERVER_B_IP
     
     echo ""
@@ -908,8 +1116,12 @@ setup_server_a() {
         check_port_conflict "$port"
     done
     
-    # Download paqet
-    download_paqet
+    # Download paqet (only if binary doesn't exist yet)
+    if [ ! -f "$PAQET_BIN" ]; then
+        download_paqet
+    else
+        print_success "paqet binary already installed"
+    fi
     
     # Create forward configuration
     print_step "Creating configuration..."
@@ -926,6 +1138,7 @@ setup_server_a() {
     
     cat > "$PAQET_CONFIG" << EOF
 # paqet Client Configuration (Port Forwarding Mode)
+# Tunnel: ${TUNNEL_NAME}
 # Generated by installer on $(date)
 role: "client"
 
@@ -956,7 +1169,7 @@ transport:
     mtu: ${DEFAULT_KCP_MTU}
 EOF
     
-    print_success "Configuration created"
+    print_success "Configuration created: $PAQET_CONFIG"
     
     # Create systemd service
     create_systemd_service
@@ -966,9 +1179,10 @@ EOF
     
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}                 Server A Ready!                            ${NC}"
+    echo -e "${GREEN}          Server A Tunnel '${TUNNEL_NAME}' Ready!              ${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo ""
+    echo -e "  ${YELLOW}Tunnel Name:${NC}   ${CYAN}$TUNNEL_NAME${NC}"
     echo -e "  ${YELLOW}This Server:${NC}   ${CYAN}$public_ip${NC}"
     echo -e "  ${YELLOW}Server B:${NC}      ${CYAN}$SERVER_B_IP:$SERVER_B_PORT${NC}"
     echo -e "  ${YELLOW}Forwarding:${NC}    ${CYAN}$FORWARD_PORTS${NC}"
@@ -989,6 +1203,8 @@ EOF
     echo -e "  Logs:    ${CYAN}journalctl -u $PAQET_SERVICE -f${NC}"
     echo -e "  Restart: ${CYAN}systemctl restart $PAQET_SERVICE${NC}"
     echo ""
+    echo -e "${YELLOW}To add another tunnel, run setup again and choose a different name.${NC}"
+    echo ""
 }
 
 #===============================================================================
@@ -1000,45 +1216,57 @@ check_status() {
     echo -e "${YELLOW}paqet Status${NC}"
     echo ""
     
-    # Service status
-    if systemctl is-active --quiet $PAQET_SERVICE 2>/dev/null; then
-        echo -e "Service: ${GREEN}● Running${NC}"
-        local uptime=$(systemctl show $PAQET_SERVICE --property=ActiveEnterTimestamp 2>/dev/null | cut -d'=' -f2)
-        [ -n "$uptime" ] && echo -e "Started: ${CYAN}$uptime${NC}"
-    else
-        echo -e "Service: ${RED}● Stopped${NC}"
+    local configs=$(get_all_configs)
+    
+    if [ -z "$configs" ]; then
+        print_error "No paqet configurations found"
+        print_info "Run setup first"
+        return 1
     fi
     
-    echo ""
-    
-    # Configuration
-    if [ -f "$PAQET_CONFIG" ]; then
-        echo -e "${YELLOW}Configuration:${NC}"
-        local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
-        echo -e "  Role: ${CYAN}$role${NC}"
+    # Show status of each tunnel
+    while IFS= read -r config_file; do
+        local name=$(get_tunnel_name "$config_file")
+        local service=$(get_tunnel_service "$config_file")
+        local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
         
-        if [ "$role" = "server" ]; then
-            local listen=$(grep "addr:" "$PAQET_CONFIG" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
-            echo -e "  Listen: ${CYAN}$listen${NC}"
+        echo -e "${YELLOW}── Tunnel: ${CYAN}${name}${YELLOW} (${role}) ──${NC}"
+        
+        # Service status
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            echo -e "  Service: ${GREEN}● Running${NC}"
+            local uptime=$(systemctl show "$service" --property=ActiveEnterTimestamp 2>/dev/null | cut -d'=' -f2)
+            [ -n "$uptime" ] && echo -e "  Started: ${CYAN}$uptime${NC}"
         else
-            local server=$(grep -A1 "^server:" "$PAQET_CONFIG" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
-            echo -e "  Server: ${CYAN}$server${NC}"
+            echo -e "  Service: ${RED}● Stopped${NC}"
         fi
-    else
-        echo -e "${YELLOW}Configuration:${NC} ${RED}Not found${NC}"
-    fi
-    
-    echo ""
+        
+        # Details
+        if [ "$role" = "server" ]; then
+            local listen=$(grep -A1 "^listen:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+            echo -e "  Listen:  ${CYAN}$listen${NC}"
+        else
+            local server=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+            local forward_ports=$(grep 'listen:' "$config_file" 2>/dev/null | grep -oE ':[0-9]+"' | tr -d ':"' | tr '\n' ',' | sed 's/,$//')
+            echo -e "  Server B: ${CYAN}$server${NC}"
+            echo -e "  Ports:   ${CYAN}$forward_ports${NC}"
+        fi
+        
+        # Recent logs (last 3 lines)
+        local recent=$(journalctl -u "$service" -n 3 --no-pager 2>/dev/null | tail -3)
+        if [ -n "$recent" ]; then
+            echo -e "  ${YELLOW}Recent logs:${NC}"
+            echo "$recent" | while IFS= read -r line; do
+                echo "    $line"
+            done
+        fi
+        
+        echo ""
+    done <<< "$configs"
     
     # Listening ports
     echo -e "${YELLOW}Listening Ports:${NC}"
     ss -tuln 2>/dev/null | grep -E "LISTEN" | awk '{print "  "$5}' | head -10 || echo "  None"
-    
-    echo ""
-    
-    # Recent logs
-    echo -e "${YELLOW}Recent Logs:${NC}"
-    journalctl -u $PAQET_SERVICE -n 5 --no-pager 2>/dev/null || echo "  No logs available"
     
     echo ""
 }
@@ -1052,13 +1280,36 @@ uninstall() {
     echo -e "${YELLOW}Uninstalling paqet...${NC}"
     echo ""
     
-    # Stop and disable service
-    print_step "Stopping service..."
-    systemctl stop $PAQET_SERVICE 2>/dev/null || true
-    systemctl disable $PAQET_SERVICE 2>/dev/null || true
-    rm -f /etc/systemd/system/${PAQET_SERVICE}.service
+    local configs=$(get_all_configs)
+    
+    if [ -n "$configs" ]; then
+        echo -e "${YELLOW}Active tunnels:${NC}"
+        echo ""
+        list_tunnels
+        echo ""
+    fi
+    
+    # Stop and disable ALL tunnel services
+    print_step "Stopping all paqet services..."
+    
+    if [ -n "$configs" ]; then
+        while IFS= read -r config_file; do
+            local service=$(get_tunnel_service "$config_file")
+            local name=$(get_tunnel_name "$config_file")
+            systemctl stop "$service" 2>/dev/null || true
+            systemctl disable "$service" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${service}.service"
+            print_success "  Stopped: $name ($service)"
+        done <<< "$configs"
+    fi
+    
+    # Also try legacy service in case it wasn't in configs
+    systemctl stop paqet 2>/dev/null || true
+    systemctl disable paqet 2>/dev/null || true
+    rm -f /etc/systemd/system/paqet.service
+    
     systemctl daemon-reload
-    print_success "Service removed"
+    print_success "All services removed"
     
     # Remove iptables rules (try common ports)
     print_step "Removing iptables rules..."
@@ -1071,13 +1322,13 @@ uninstall() {
     
     # Ask about config preservation
     echo ""
-    read_confirm "Remove configuration and binary?" remove_all "n"
+    read_confirm "Remove all configurations and binary?" remove_all "n"
     
     if [ "$remove_all" = true ]; then
         rm -rf "$PAQET_DIR"
         print_success "All paqet files removed"
     else
-        print_warning "Configuration preserved at: $PAQET_CONFIG"
+        print_warning "Configurations preserved at: $PAQET_DIR/"
     fi
     
     # Ask about removing the command
@@ -1100,7 +1351,15 @@ uninstall() {
 
 view_config() {
     print_banner
-    echo -e "${YELLOW}Current Configuration${NC}"
+    echo -e "${YELLOW}View Configuration${NC}"
+    echo ""
+    
+    # Select tunnel if multiple exist
+    select_tunnel "Select tunnel to view" || return 1
+    
+    echo ""
+    local name=$(get_tunnel_name "$PAQET_CONFIG")
+    echo -e "${YELLOW}Configuration for tunnel '${name}':${NC}"
     echo ""
     
     if [ -f "$PAQET_CONFIG" ]; then
@@ -1123,16 +1382,15 @@ edit_config() {
     echo -e "${YELLOW}Edit Configuration${NC}"
     echo ""
     
-    if [ ! -f "$PAQET_CONFIG" ]; then
-        print_error "Configuration not found at $PAQET_CONFIG"
-        print_info "Please run setup first"
-        return 1
-    fi
+    # Select tunnel if multiple exist
+    select_tunnel "Select tunnel to edit" || return 1
     
     # Detect current role
     local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    local name=$(get_tunnel_name "$PAQET_CONFIG")
     
-    echo -e "Current role: ${CYAN}$role${NC}"
+    echo ""
+    echo -e "Tunnel: ${CYAN}$name${NC}  Role: ${CYAN}$role${NC}"
     echo ""
     echo -e "${YELLOW}What would you like to edit?${NC}"
     echo ""
@@ -1620,7 +1878,8 @@ edit_kcp_settings() {
     echo -e "${YELLOW}MTU (Maximum Transmission Unit):${NC}"
     echo -e "  ${CYAN}1400-1500${NC} - Normal networks"
     echo -e "  ${CYAN}1350${NC}      - Recommended for most cases"
-    echo -e "  ${CYAN}1280-1300${NC} - Restrictive networks / connection issues"
+    echo -e "  ${CYAN}1280-1300${NC} - Restrictive networks / EOF or connection issues"
+    echo -e "  ${YELLOW}Tip:${NC} If you get EOF errors, try MTU 1280 on BOTH ends of this tunnel."
     echo ""
     
     local current_mtu=$(grep "mtu:" "$PAQET_CONFIG" | awk '{print $2}')
@@ -1723,15 +1982,14 @@ test_connection() {
     echo -e "${YELLOW}Connection Test Tool${NC}"
     echo ""
     
-    if [ ! -f "$PAQET_CONFIG" ]; then
-        print_error "paqet is not configured on this server"
-        print_info "Please run setup first"
-        return 1
-    fi
+    # Select tunnel if multiple exist
+    select_tunnel "Select tunnel to test" || return 1
     
     local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    local name=$(get_tunnel_name "$PAQET_CONFIG")
     
-    echo -e "Detected role: ${CYAN}$role${NC}"
+    echo ""
+    echo -e "Tunnel: ${CYAN}$name${NC}  Role: ${CYAN}$role${NC}"
     echo ""
     
     # Check if service is running
@@ -1928,6 +2186,143 @@ test_server_a() {
 }
 
 #===============================================================================
+# Manage Tunnels Menu
+#===============================================================================
+
+manage_tunnels_menu() {
+    while true; do
+        print_banner
+        echo -e "${YELLOW}Manage Tunnels${NC}"
+        echo ""
+        
+        # Show all tunnels
+        local configs=$(get_all_configs)
+        if [ -n "$configs" ]; then
+            echo -e "${YELLOW}Current Tunnels:${NC}"
+            echo ""
+            list_tunnels
+        else
+            print_info "No tunnels configured yet"
+        fi
+        
+        echo ""
+        echo -e "${YELLOW}Options:${NC}"
+        echo ""
+        echo -e "  ${CYAN}1)${NC} Add new tunnel (setup Server A)"
+        echo -e "  ${CYAN}2)${NC} Remove a tunnel"
+        echo -e "  ${CYAN}3)${NC} Restart a tunnel"
+        echo -e "  ${CYAN}4)${NC} Stop a tunnel"
+        echo -e "  ${CYAN}5)${NC} Start a tunnel"
+        echo -e "  ${CYAN}0)${NC} Back to main menu"
+        echo ""
+        
+        read -p "Choice: " manage_choice < /dev/tty
+        
+        case $manage_choice in
+            1) run_iran_optimizations; install_dependencies; setup_server_a ;;
+            2) remove_tunnel ;;
+            3) tunnel_service_action "restart" ;;
+            4) tunnel_service_action "stop" ;;
+            5) tunnel_service_action "start" ;;
+            0) return 0 ;;
+            *) print_error "Invalid choice" ;;
+        esac
+        
+        echo ""
+        echo -e "${YELLOW}Press Enter to continue...${NC}"
+        read < /dev/tty
+    done
+}
+
+# Remove a specific tunnel
+remove_tunnel() {
+    echo ""
+    
+    local configs=$(get_all_configs)
+    if [ -z "$configs" ]; then
+        print_error "No tunnels to remove"
+        return 1
+    fi
+    
+    select_tunnel "Select tunnel to remove" || return 1
+    
+    local name=$(get_tunnel_name "$PAQET_CONFIG")
+    local service="$PAQET_SERVICE"
+    
+    echo ""
+    print_warning "This will remove tunnel '$name':"
+    echo -e "  Config:  ${CYAN}$PAQET_CONFIG${NC}"
+    echo -e "  Service: ${CYAN}$service${NC}"
+    echo ""
+    
+    read_confirm "Are you sure?" confirm_remove "n"
+    
+    if [ "$confirm_remove" = true ]; then
+        # Stop and disable service
+        print_step "Stopping service $service..."
+        systemctl stop "$service" 2>/dev/null || true
+        systemctl disable "$service" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${service}.service"
+        systemctl daemon-reload
+        print_success "Service removed"
+        
+        # Remove config
+        rm -f "$PAQET_CONFIG"
+        print_success "Configuration removed"
+        
+        # Check if any tunnels remain
+        local remaining=$(get_all_configs)
+        if [ -z "$remaining" ]; then
+            echo ""
+            read_confirm "No tunnels remaining. Remove paqet binary too?" remove_bin "n"
+            if [ "$remove_bin" = true ]; then
+                rm -rf "$PAQET_DIR"
+                print_success "All paqet files removed"
+            fi
+        fi
+        
+        echo ""
+        print_success "Tunnel '$name' removed"
+    else
+        print_info "Cancelled"
+    fi
+    
+    # Reset globals to defaults
+    PAQET_CONFIG="$PAQET_DIR/config.yaml"
+    PAQET_SERVICE="paqet"
+}
+
+# Restart/stop/start a tunnel service
+tunnel_service_action() {
+    local action="$1"
+    echo ""
+    
+    select_tunnel "Select tunnel to $action" || return 1
+    
+    local name=$(get_tunnel_name "$PAQET_CONFIG")
+    
+    print_step "${action^}ing tunnel '$name' ($PAQET_SERVICE)..."
+    
+    if systemctl "$action" "$PAQET_SERVICE" 2>/dev/null; then
+        sleep 1
+        if [ "$action" = "stop" ]; then
+            print_success "Tunnel '$name' stopped"
+        elif systemctl is-active --quiet "$PAQET_SERVICE" 2>/dev/null; then
+            print_success "Tunnel '$name' is running"
+        else
+            print_error "Tunnel '$name' failed to start"
+            echo -e "${YELLOW}Check logs:${NC} journalctl -u $PAQET_SERVICE -n 20"
+        fi
+    else
+        print_error "Failed to $action tunnel '$name'"
+    fi
+    
+    # Reset globals
+    PAQET_CONFIG="$PAQET_DIR/config.yaml"
+    PAQET_SERVICE="paqet"
+}
+
+#===============================================================================
 # Auto-Updater
 #===============================================================================
 
@@ -2008,10 +2403,13 @@ update_installer() {
             local new_version=$(grep '^INSTALLER_VERSION=' "$temp_script" | cut -d'"' -f2)
             print_success "Downloaded version: $new_version"
             
-            # Backup current config if exists
-            if [ -f "$PAQET_CONFIG" ]; then
-                cp "$PAQET_CONFIG" "${PAQET_CONFIG}.backup"
-                print_info "Configuration backed up to ${PAQET_CONFIG}.backup"
+            # Backup current configs if they exist
+            local backup_configs=$(get_all_configs 2>/dev/null)
+            if [ -n "$backup_configs" ]; then
+                while IFS= read -r cfg; do
+                    cp "$cfg" "${cfg}.backup"
+                done <<< "$backup_configs"
+                print_info "Configurations backed up"
             fi
             
             echo ""
@@ -2153,12 +2551,13 @@ main() {
         echo -e "  ${CYAN}3)${NC} Check Status"
         echo -e "  ${CYAN}4)${NC} View Configuration"
         echo -e "  ${CYAN}5)${NC} Edit Configuration"
-        echo -e "  ${CYAN}6)${NC} Test Connection"
+        echo -e "  ${CYAN}6)${NC} Manage Tunnels (add/remove/restart)"
+        echo -e "  ${CYAN}7)${NC} Test Connection"
         echo ""
         echo -e "  ${GREEN}── Maintenance ──${NC}"
-        echo -e "  ${CYAN}7)${NC} Check for Updates"
-        echo -e "  ${CYAN}8)${NC} Show Port Defaults"
-        echo -e "  ${CYAN}9)${NC} Uninstall paqet"
+        echo -e "  ${CYAN}8)${NC} Check for Updates"
+        echo -e "  ${CYAN}9)${NC} Show Port Defaults"
+        echo -e "  ${CYAN}u)${NC} Uninstall paqet"
         echo ""
         echo -e "  ${GREEN}── Script ──${NC}"
         if is_command_installed; then
@@ -2177,10 +2576,11 @@ main() {
             3) check_status ;;
             4) view_config ;;
             5) edit_config ;;
-            6) test_connection ;;
-            7) check_for_updates ;;
-            8) show_port_config ;;
-            9) uninstall ;;
+            6) manage_tunnels_menu ;;
+            7) test_connection ;;
+            8) check_for_updates ;;
+            9) show_port_config ;;
+            [Uu]) uninstall ;;
             [Ii]) install_command ;;
             [Rr]) uninstall_command ;;
             0) exit 0 ;;
