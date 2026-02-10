@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.9.0"
+INSTALLER_VERSION="1.10.0"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
@@ -32,7 +32,7 @@ DEFAULT_PAQET_PORT="8888"           # Port for paqet tunnel communication
 DEFAULT_FORWARD_PORTS="9090"        # Default ports to forward (comma-separated)
 DEFAULT_KCP_MODE="fast"             # KCP mode: normal, fast, fast2, fast3
 DEFAULT_KCP_CONN="1"                # Number of parallel connections
-DEFAULT_KCP_MTU="1350"              # MTU size (1280-1500, lower for restrictive networks)
+DEFAULT_KCP_MTU="1280"              # MTU size (1280-1500, lower for restrictive networks)
 
 # Colors
 RED='\033[0;31m'
@@ -866,13 +866,57 @@ setup_iptables() {
     iptables -t raw -D PREROUTING -p tcp --dport $port -j NOTRACK 2>/dev/null || true
     iptables -t raw -D OUTPUT -p tcp --sport $port -j NOTRACK 2>/dev/null || true
     iptables -t mangle -D OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
     
     # Add new rules
     iptables -t raw -A PREROUTING -p tcp --dport $port -j NOTRACK
     iptables -t raw -A OUTPUT -p tcp --sport $port -j NOTRACK
+    # Block outgoing RST from kernel (prevents kernel interference with raw sockets)
     iptables -t mangle -A OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP
+    # Block incoming fake RST packets (some ISPs inject spoofed RSTs to kill tunnels)
+    iptables -t mangle -A PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP
     
-    # Save iptables rules
+    save_iptables
+    print_success "iptables configured"
+}
+
+# Setup iptables for Server A (client) - targets Server B's IP:port
+# Server A uses ephemeral ports, so rules must match by destination (Server B)
+setup_iptables_client() {
+    local server_ip=$1
+    local server_port=$2
+    print_step "Configuring iptables for tunnel to $server_ip:$server_port..."
+    
+    # Remove existing rules if any
+    iptables -t raw -D OUTPUT -p tcp -d $server_ip --dport $server_port -j NOTRACK 2>/dev/null || true
+    iptables -t raw -D PREROUTING -p tcp -s $server_ip --sport $server_port -j NOTRACK 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -d $server_ip --dport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -p tcp -s $server_ip --sport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    
+    # Bypass kernel connection tracking for tunnel traffic
+    iptables -t raw -A OUTPUT -p tcp -d $server_ip --dport $server_port -j NOTRACK
+    iptables -t raw -A PREROUTING -p tcp -s $server_ip --sport $server_port -j NOTRACK
+    # Block outgoing RST from kernel to Server B (prevents kernel from killing raw socket connections)
+    iptables -t mangle -A OUTPUT -p tcp -d $server_ip --dport $server_port --tcp-flags RST RST -j DROP
+    # Block incoming fake RST from middleboxes (ISPs inject spoofed RSTs appearing to come from Server B)
+    iptables -t mangle -A PREROUTING -p tcp -s $server_ip --sport $server_port --tcp-flags RST RST -j DROP
+    
+    save_iptables
+    print_success "iptables configured (connection protection rules active)"
+}
+
+# Remove iptables client rules for a specific Server B target
+remove_iptables_client() {
+    local server_ip=$1
+    local server_port=$2
+    iptables -t raw -D OUTPUT -p tcp -d $server_ip --dport $server_port -j NOTRACK 2>/dev/null || true
+    iptables -t raw -D PREROUTING -p tcp -s $server_ip --sport $server_port -j NOTRACK 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -d $server_ip --dport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -p tcp -s $server_ip --sport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
+}
+
+# Save iptables rules to persistent storage
+save_iptables() {
     if command -v iptables-save &> /dev/null; then
         if [ -d /etc/iptables ]; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -880,8 +924,6 @@ setup_iptables() {
             iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
         fi
     fi
-    
-    print_success "iptables configured"
 }
 
 create_systemd_service() {
@@ -1175,6 +1217,9 @@ EOF
     
     print_success "Configuration created: $PAQET_CONFIG"
     
+    # Setup iptables protection rules for tunnel to Server B
+    setup_iptables_client "$SERVER_B_IP" "$SERVER_B_PORT"
+    
     # Create systemd service
     create_systemd_service
     
@@ -1321,13 +1366,33 @@ uninstall() {
     systemctl daemon-reload
     print_success "All services removed"
     
-    # Remove iptables rules (try common ports)
+    # Remove iptables rules
     print_step "Removing iptables rules..."
+    
+    # Remove Server B rules (try common ports)
     for port in 8888 9999 8080; do
         iptables -t raw -D PREROUTING -p tcp --dport $port -j NOTRACK 2>/dev/null || true
         iptables -t raw -D OUTPUT -p tcp --sport $port -j NOTRACK 2>/dev/null || true
         iptables -t mangle -D OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
+        iptables -t mangle -D PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
     done
+    
+    # Remove Server A (client) rules by reading existing configs
+    if [ -n "$configs" ]; then
+        while IFS= read -r config_file; do
+            local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
+            if [ "$role" = "client" ]; then
+                local server_addr=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+                local s_ip=$(echo "$server_addr" | cut -d':' -f1)
+                local s_port=$(echo "$server_addr" | cut -d':' -f2)
+                if [ -n "$s_ip" ] && [ -n "$s_port" ]; then
+                    remove_iptables_client "$s_ip" "$s_port"
+                fi
+            fi
+        done <<< "$configs"
+    fi
+    
+    save_iptables
     print_success "iptables rules removed"
     
     # Ask about config preservation
@@ -1641,6 +1706,10 @@ change_paqet_port_client() {
     
     # Update server address
     sed -i "s|addr: \"${server_ip}:${server_port}\"|addr: \"${server_ip}:${NEW_PORT}\"|" "$PAQET_CONFIG"
+    
+    # Update iptables rules for new port
+    remove_iptables_client "$server_ip" "$server_port"
+    setup_iptables_client "$server_ip" "$NEW_PORT"
     
     print_success "Server B port updated to $NEW_PORT"
     
@@ -1981,6 +2050,12 @@ edit_server_address() {
     
     sed -i "s|addr: \"${current_addr}\"|addr: \"${NEW_SERVER_IP}:${NEW_SERVER_PORT}\"|" "$PAQET_CONFIG"
     
+    # Update iptables rules: remove old target, add new target
+    if [ -n "$current_ip" ] && [ -n "$current_port" ]; then
+        remove_iptables_client "$current_ip" "$current_port"
+    fi
+    setup_iptables_client "$NEW_SERVER_IP" "$NEW_SERVER_PORT"
+    
     print_success "Server B address updated to ${NEW_SERVER_IP}:${NEW_SERVER_PORT}"
     
     echo ""
@@ -2150,8 +2225,22 @@ test_server_a() {
     
     echo ""
     
-    # Test 3: Check forwarded ports
-    print_step "Test 3: Checking forwarded ports..."
+    # Test 3: Check connection protection iptables rules
+    print_step "Test 3: Checking connection protection iptables rules..."
+    local raw_rules=$(iptables -t raw -L -n 2>/dev/null | grep -c "$server_ip" || echo "0")
+    local mangle_rules=$(iptables -t mangle -L -n 2>/dev/null | grep -c "$server_ip" || echo "0")
+    
+    if [ "$raw_rules" -gt 0 ] && [ "$mangle_rules" -gt 0 ]; then
+        print_success "Connection protection iptables rules are active"
+    else
+        print_warning "Connection protection iptables rules are missing"
+        print_info "Run 'Connection Protection & MTU Tuning' (option d) from the main menu to fix"
+    fi
+    
+    echo ""
+    
+    # Test 4: Check forwarded ports
+    print_step "Test 4: Checking forwarded ports..."
     local forward_ports=$(grep -A10 "^forward:" "$PAQET_CONFIG" | grep "listen:" | sed 's/.*:\([0-9]*\)".*/\1/' | tr '\n' ' ')
     
     for port in $forward_ports; do
@@ -2164,8 +2253,8 @@ test_server_a() {
     
     echo ""
     
-    # Test 4: Check recent tunnel activity
-    print_step "Test 4: Checking tunnel activity..."
+    # Test 5: Check recent tunnel activity
+    print_step "Test 5: Checking tunnel activity..."
     local recent_logs=$(journalctl -u $PAQET_SERVICE --since "5 minutes ago" 2>/dev/null | grep -iE "connect|tunnel|forward" | tail -3)
     if [ -n "$recent_logs" ]; then
         echo "$recent_logs"
@@ -2175,7 +2264,7 @@ test_server_a() {
     
     echo ""
     
-    # Test 5: End-to-end test (if user wants)
+    # Test 6: End-to-end test (if user wants)
     echo -e "${YELLOW}Would you like to run an end-to-end test?${NC}"
     echo -e "${CYAN}This will attempt to connect through the tunnel.${NC}"
     read_confirm "Run end-to-end test?" run_e2e "n"
@@ -2276,6 +2365,18 @@ remove_tunnel() {
     read_confirm "Are you sure?" confirm_remove "n"
     
     if [ "$confirm_remove" = true ]; then
+        # Remove iptables rules for this tunnel
+        local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+        if [ "$role" = "client" ]; then
+            local server_addr=$(grep -A1 "^server:" "$PAQET_CONFIG" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+            local s_ip=$(echo "$server_addr" | cut -d':' -f1)
+            local s_port=$(echo "$server_addr" | cut -d':' -f2)
+            if [ -n "$s_ip" ] && [ -n "$s_port" ]; then
+                remove_iptables_client "$s_ip" "$s_port"
+                save_iptables
+            fi
+        fi
+        
         # Stop and disable service
         print_step "Stopping service $service..."
         systemctl stop "$service" 2>/dev/null || true
@@ -2465,6 +2566,121 @@ manual_reset_all() {
     if [ $count -gt 0 ]; then
         print_success "Manual reset complete ($count service(s) restarted)"
     fi
+    echo ""
+}
+
+#===============================================================================
+# Connection Protection & MTU Tuning
+#===============================================================================
+
+apply_connection_protection() {
+    print_banner
+    echo -e "${YELLOW}Connection Protection & MTU Tuning${NC}"
+    echo -e "${CYAN}Applies iptables rules to improve tunnel stability and resist fake disconnects${NC}"
+    echo ""
+    echo -e "${YELLOW}What this does:${NC}"
+    echo -e "  - Blocks fake RST packets injected by ISP middleboxes"
+    echo -e "  - Bypasses kernel connection tracking for tunnel traffic"
+    echo -e "  - Prevents kernel from sending RST packets that break raw socket tunnels"
+    echo -e "  - Optionally lowers MTU to avoid large-packet fingerprinting"
+    echo ""
+    
+    local configs=$(get_all_configs)
+    if [ -z "$configs" ]; then
+        print_error "No tunnels configured. Set up a server first."
+        return 1
+    fi
+    
+    local applied=0
+    
+    while IFS= read -r config_file; do
+        local name=$(get_tunnel_name "$config_file")
+        local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
+        
+        if [ "$role" = "server" ]; then
+            # Server B: apply server-side rules
+            local listen_port=$(grep -A1 "^listen:" "$config_file" 2>/dev/null | grep "addr:" | grep -oE '[0-9]+' | tail -1)
+            if [ -n "$listen_port" ]; then
+                echo -e "${CYAN}Tunnel '${name}' (Server B) — port $listen_port${NC}"
+                setup_iptables "$listen_port"
+                applied=$((applied + 1))
+            else
+                print_warning "Could not detect port for tunnel '$name', skipping"
+            fi
+        elif [ "$role" = "client" ]; then
+            # Server A: apply client-side rules targeting Server B
+            local server_addr=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+            local s_ip=$(echo "$server_addr" | cut -d':' -f1)
+            local s_port=$(echo "$server_addr" | cut -d':' -f2)
+            if [ -n "$s_ip" ] && [ -n "$s_port" ]; then
+                echo -e "${CYAN}Tunnel '${name}' (Server A) — target $s_ip:$s_port${NC}"
+                setup_iptables_client "$s_ip" "$s_port"
+                applied=$((applied + 1))
+            else
+                print_warning "Could not detect Server B address for tunnel '$name', skipping"
+            fi
+        fi
+    done <<< "$configs"
+    
+    echo ""
+    if [ "$applied" -gt 0 ]; then
+        print_success "Protection rules applied to $applied tunnel(s)"
+    else
+        print_warning "No tunnels were updated"
+    fi
+    
+    # Offer MTU reduction
+    echo ""
+    echo -e "${YELLOW}MTU Optimization:${NC}"
+    echo -e "  Some ISP systems detect and block large packets."
+    echo -e "  Lowering MTU can help avoid this fingerprinting."
+    echo -e "  Current recommended value: ${CYAN}1280${NC}"
+    echo ""
+    
+    read_confirm "Lower MTU to 1280 on all tunnels?" lower_mtu "y"
+    
+    if [ "$lower_mtu" = true ]; then
+        local mtu_updated=0
+        while IFS= read -r config_file; do
+            local current_mtu=$(grep "mtu:" "$config_file" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+            if [ -n "$current_mtu" ] && [ "$current_mtu" -gt 1280 ]; then
+                sed -i "s/mtu: .*/mtu: 1280/" "$config_file"
+                local name=$(get_tunnel_name "$config_file")
+                print_info "  $name: MTU $current_mtu -> 1280"
+                mtu_updated=$((mtu_updated + 1))
+            fi
+        done <<< "$configs"
+        
+        if [ "$mtu_updated" -gt 0 ]; then
+            print_success "MTU updated on $mtu_updated tunnel(s)"
+            echo ""
+            read_confirm "Restart all paqet services to apply changes?" restart_now "y"
+            if [ "$restart_now" = true ]; then
+                while IFS= read -r config_file; do
+                    local service=$(get_tunnel_service "$config_file")
+                    systemctl restart "$service" 2>/dev/null || true
+                done <<< "$configs"
+                print_success "All services restarted"
+            fi
+        else
+            print_info "All tunnels already at MTU 1280 or below"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}      Connection Protection & MTU Tuning Complete           ${NC}"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${YELLOW}Active protections:${NC}"
+    echo -e "  - Fake RST injection blocked (iptables mangle)"
+    echo -e "  - Kernel connection tracking bypassed (iptables raw NOTRACK)"
+    echo -e "  - Kernel RST responses suppressed"
+    echo ""
+    echo -e "${YELLOW}If issues persist:${NC}"
+    echo -e "  - Try changing the paqet port to a less common port"
+    echo -e "  - Try KCP mode 'fast3' for aggressive retransmission"
+    echo -e "  - Apply this optimization on BOTH Server A and Server B"
     echo ""
 }
 
@@ -2828,6 +3044,7 @@ main() {
         echo -e "  ${CYAN}8)${NC} Check for Updates"
         echo -e "  ${CYAN}9)${NC} Show Port Defaults"
         echo -e "  ${CYAN}a)${NC} Automatic Reset (scheduled restart)"
+        echo -e "  ${CYAN}d)${NC} Connection Protection & MTU Tuning (fix fake RST/disconnects)"
         echo -e "  ${CYAN}u)${NC} Uninstall paqet"
         echo ""
         echo -e "  ${GREEN}── Script ──${NC}"
@@ -2850,6 +3067,7 @@ main() {
             8) check_for_updates ;;
             9) show_port_config ;;
             [Aa]) auto_reset_menu ;;
+            [Dd]) apply_connection_protection ;;
             [Uu]) uninstall ;;
             [Ii]) install_command ;;
             [Rr]) uninstall_command ;;

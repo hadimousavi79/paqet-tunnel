@@ -2,9 +2,17 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.9.0
+**Current Version:** v1.10.0
 
 ## Changelog
+
+### v1.10.0
+- **Connection Protection & MTU Tuning** - New menu option (**d**) under Maintenance to apply iptables rules that:
+  - Bypass kernel connection tracking (raw table `NOTRACK`)
+  - Block fake RST packets injected by ISP or middleboxes (mangle `PREROUTING`/`OUTPUT`)
+  - Prevent the kernel from sending RST packets that interfere with paqet's raw socket tunnel
+- **Client-Side Protection** - Server A (Iran) now automatically installs connection protection iptables rules at setup time, targeting Server B's IP:port
+- **MTU Default Updated** - Default KCP MTU changed from `1350` to `1280` for better reliability on restrictive networks
 
 ### v1.9.0
 - **Automatic Reset** - Option (a) for scheduled service restarts (configurable interval)
@@ -64,6 +72,7 @@ Easy installer for tunneling VPN traffic through a middle server using [paqet](h
 - **Auto-Updater** - Check for and install updates from within the script
 - **Automatic Reset** - Scheduled service restart for reliability (configurable interval)
 - **Smart Defaults** - Sensible defaults with easy customization
+- **Connection Protection** - iptables rules and tools to resist fake RST injection and connection drops
 
 ## Use Case
 
@@ -266,7 +275,7 @@ You can adjust:
 
 - **Mode**: `normal`, `fast`, `fast2`, `fast3`
 - **Connections**: number of parallel KCP connections
-- **MTU**: default `1350` (try `1280-1300` on problematic networks)
+- **MTU**: default `1280` (try `1280-1300` on problematic networks)
 
 ### Manual Tuning Example
 
@@ -279,7 +288,7 @@ transport:
   kcp:
     mode: "fast3"            # Aggressive retransmission
     key: "YOUR_SECRET_KEY"
-    mtu: 1350                # Lower for restrictive networks (1280–1400)
+    mtu: 1280                # Default for restrictive networks (1280–1400)
     snd_wnd: 2048            # Large send window
     rcv_wnd: 2048            # Large receive window
     data_shard: 10           # FEC error correction
